@@ -14,20 +14,63 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Função para conectar ao banco de dados
-@st.cache_resource
-def get_db_connection():
-    """Conecta ao banco de dados SQLite"""
+# Variável global para armazenar a conexão
+_conn_cache = None
+
+# Função para obter uma conexão válida
+def get_valid_connection():
+    """Retorna uma conexão válida ao banco de dados"""
+    global _conn_cache
+    
+    # Verifica se a conexão existe e está válida
+    if _conn_cache is not None:
+        try:
+            # Testa se a conexão ainda está válida
+            _conn_cache.execute("SELECT 1")
+            return _conn_cache
+        except (sqlite3.ProgrammingError, sqlite3.OperationalError, sqlite3.InterfaceError):
+            # Conexão inválida, fecha e recria
+            try:
+                _conn_cache.close()
+            except:
+                pass
+            _conn_cache = None
+    
+    # Cria nova conexão
     db_path = Path('bolsa_atleta.db')
     if not db_path.exists():
         st.error(f"Banco de dados não encontrado: {db_path}")
         st.stop()
-    return sqlite3.connect(str(db_path))
+    
+    _conn_cache = sqlite3.connect(str(db_path), check_same_thread=False)
+    _conn_cache.execute("PRAGMA busy_timeout = 30000")
+    return _conn_cache
+
+# Função para conectar ao banco de dados (mantida para compatibilidade)
+@st.cache_resource
+def get_db_connection():
+    """Conecta ao banco de dados SQLite"""
+    return get_valid_connection()
 
 # Função auxiliar para executar queries
-def fetch_query(query: str, conn: sqlite3.Connection) -> pd.DataFrame:
+def fetch_query(query: str, conn: sqlite3.Connection = None) -> pd.DataFrame:
     """Executa uma query SQL e retorna um DataFrame"""
-    return pd.read_sql_query(query, conn)
+    # Sempre usa uma conexão válida do cache global
+    valid_conn = get_valid_connection()
+    
+    try:
+        return pd.read_sql_query(query, valid_conn)
+    except (sqlite3.ProgrammingError, sqlite3.OperationalError, sqlite3.InterfaceError) as e:
+        # Se houver erro, limpa o cache e tenta novamente com uma nova conexão
+        global _conn_cache
+        try:
+            if _conn_cache:
+                _conn_cache.close()
+        except:
+            pass
+        _conn_cache = None
+        valid_conn = get_valid_connection()
+        return pd.read_sql_query(query, valid_conn)
 
 # Função para obter estatísticas gerais
 @st.cache_data
@@ -58,8 +101,19 @@ def get_statistics(_conn):
     
     return stats
 
-# Conexão com o banco de dados
-conn = get_db_connection()
+# Função helper para garantir conexão válida
+def ensure_valid_connection(current_conn):
+    """Garante que a conexão passada está válida, retorna uma nova se necessário"""
+    if current_conn is None:
+        return get_valid_connection()
+    try:
+        current_conn.execute("SELECT 1")
+        return current_conn
+    except (sqlite3.ProgrammingError, sqlite3.OperationalError, sqlite3.InterfaceError):
+        return get_valid_connection()
+
+# Conexão com o banco de dados (sempre obtém uma conexão válida)
+conn = get_valid_connection()
 
 # Sidebar para navegação e filtros
 st.sidebar.title("📊 Navegação")
@@ -233,6 +287,9 @@ if page == "Visão Geral":
         base_query = f"SELECT * {join_clause} WHERE {where_clause}"
     else:
         base_query = f"SELECT * {join_clause}"
+    
+    # Garantir que temos uma conexão válida antes de executar queries
+    conn = ensure_valid_connection(conn)
     
     # Obter estatísticas com filtros
     if where_clause:
